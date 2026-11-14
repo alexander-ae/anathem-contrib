@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""git-capture: the reason behind a commit, as a memory.
+
+A post-commit hook that writes nothing unless the commit says why:
+
+    fix(api): use Adyen for card payments
+
+    Why: the old provider dropped webhooks silently and we lost three
+    refunds before anybody noticed.
+    Topic: payment-provider      (optional)
+
+The `Why:` trailer turns the commit into memory. Without it the hook is a
+no-op, which is the point: a hook that saves every commit is the noise anathem
+exists to avoid.
+
+`Topic:` is optional and makes the note replace the previous one for that
+subject, the way any evolving fact does.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+MARK_BEGIN = "# >>> anathem-contrib: git-capture >>>"
+MARK_END = "# <<< anathem-contrib: git-capture <<<"
+HOOK = f"""#!/bin/sh
+{MARK_BEGIN}
+if command -v git-capture >/dev/null 2>&1; then
+  git-capture run || true
+fi
+{MARK_END}
+"""
+STATE = "anathem-capture"
+
+
+def git(repo, *args, check=True):
+    proc = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    if check and proc.returncode != 0:
+        raise SystemExit(f"git-capture: git {' '.join(args)} failed: {proc.stderr.strip()}")
+    return proc
+
+
+def repo_root(path):
+    proc = git(path, "rev-parse", "--show-toplevel", check=False)
+    if proc.returncode != 0:
+        raise SystemExit(f"git-capture: {path} is not a git repository")
+    return proc.stdout.strip()
+
+
+def hooks_dir(repo):
+    path = git(repo, "rev-parse", "--git-path", "hooks").stdout.strip()
+    return path if os.path.isabs(path) else os.path.join(repo, path)
+
+
+def trailers(message):
+    """The trailers in the last paragraph, lowercased keys.
+
+    Git puts them last and after a blank line; reading only that paragraph is
+    what keeps a `Why:` written in prose from being mistaken for one.
+    """
+    paragraphs = [p for p in re.split(r"\n\s*\n", message.strip()) if p.strip()]
+    if not paragraphs:
+        return {}
+    out, key = {}, None
+    for line in paragraphs[-1].splitlines():
+        match = re.match(r"^([A-Za-z][A-Za-z-]*):\s*(.*)$", line)
+        if match:
+            key = match.group(1).lower()
+            out[key] = match.group(2).strip()
+        elif key and line[:1].isspace():
+            out[key] += " " + line.strip()
+        else:
+            key = None
+    return out
+
+
+def memory_body(subject, why, sha, branch, files):
+    lines = [subject, "", why, "", f"commit {sha}"]
+    if branch:
+        lines.append(f"branch {branch}")
+    if files:
+        shown = ", ".join(files[:3])
+        more = f", +{len(files) - 3}" if len(files) > 3 else ""
+        lines.append(f"files {len(files)} changed ({shown}{more})")
+    return "\n".join(lines) + "\n"
+
+
+def state_path(repo, name):
+    git_dir = git(repo, "rev-parse", "--git-dir").stdout.strip()
+    if not os.path.isabs(git_dir):
+        git_dir = os.path.join(repo, git_dir)
+    return os.path.join(git_dir, name)
+
+
+def cmd_run(args):
+    repo = repo_root(args.repo)
+    sha = git(repo, "rev-parse", "HEAD").stdout.strip()
+    marker = state_path(repo, STATE)
+
+    if not args.dry_run and not args.force and os.path.exists(marker):
+        with open(marker, encoding="utf-8") as fh:
+            if fh.read().strip() == sha:
+                return 0
+
+    message = git(repo, "log", "-1", "--format=%B").stdout
+    parsed = trailers(message)
+    why = parsed.get("why", "").strip()
+    if not why:
+        return 0
+
+    subject = message.strip().splitlines()[0].strip()
+    branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD", check=False).stdout.strip()
+    files = [f for f in git(repo, "diff-tree", "--no-commit-id", "--name-only",
+                             "-r", "--root", sha).stdout.splitlines() if f]
+    body = memory_body(subject, why, sha, branch, files)
+
+    if args.dry_run:
+        print(body, end="")
+        return 0
+
+    cmd = [args.mem] + (["--db", args.db] if args.db else []) + \
+        ["--json", "save", "-"]
+    if parsed.get("topic"):
+        cmd += ["--topic", parsed["topic"]]
+    proc = subprocess.run(cmd, input=body, text=True, capture_output=True)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        return proc.returncode
+
+    try:
+        saved = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        sys.stderr.write(proc.stderr)
+        print("git-capture: mem did not answer with JSON; the memory may not be saved.",
+              file=sys.stderr)
+        return 1
+
+    with open(marker, "w", encoding="utf-8") as fh:
+        fh.write(sha + "\n")
+    note = f" (replaces {saved['replaced']})" if saved.get("replaced") else ""
+    print(f"git-capture: memory {saved['id']} for {sha[:8]}{note}")
+    return 0
+
+
+def cmd_install(args):
+    repo = repo_root(args.repo)
+    path = os.path.join(hooks_dir(repo), "post-commit")
+    existing = ""
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            existing = fh.read()
+        if MARK_BEGIN in existing:
+            print(f"git-capture: already installed in {path}")
+            return 0
+    if existing.strip():
+        if not existing.endswith("\n"):
+            existing += "\n"
+        body = existing + "\n" + HOOK
+    else:
+        body = HOOK
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    os.chmod(path, 0o755)
+    print(f"git-capture: installed in {path}")
+    return 0
+
+
+def cmd_uninstall(args):
+    repo = repo_root(args.repo)
+    path = os.path.join(hooks_dir(repo), "post-commit")
+    if not os.path.exists(path):
+        print("git-capture: nothing to uninstall")
+        return 0
+    with open(path, encoding="utf-8") as fh:
+        lines = fh.read().splitlines(keepends=True)
+    keep, inside = [], False
+    for line in lines:
+        if MARK_BEGIN in line:
+            inside = True
+        elif MARK_END in line:
+            inside = False
+        elif not inside:
+            keep.append(line)
+    rest = "".join(keep).strip()
+    if rest in ("#!/bin/sh", "#! /bin/sh", ""):
+        os.remove(path)
+        print(f"git-capture: removed {path}")
+    else:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("".join(keep).rstrip() + "\n")
+        print(f"git-capture: block removed from {path}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="git-capture",
+        description="Saves the `Why:` trailer of a commit as an anathem memory.",
+    )
+    ap.add_argument("--repo", default=".", help="repository (default: the current directory)")
+    ap.add_argument("--mem", default=os.environ.get("MEM_BIN", "mem"),
+                    help="the mem binary (default: $MEM_BIN or mem)")
+    ap.add_argument("--db", default=os.environ.get("ANATHEM_DB"),
+                    help="passed through to `mem --db` (default: $ANATHEM_DB)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_run = sub.add_parser("run", help="capture HEAD (what the hook calls)")
+    p_run.add_argument("--dry-run", action="store_true", help="print the memory, save nothing")
+    p_run.add_argument("--force", action="store_true", help="capture HEAD even if it was captured")
+    p_run.set_defaults(func=cmd_run)
+
+    p_install = sub.add_parser("install", help="add the post-commit hook")
+    p_install.set_defaults(func=cmd_install)
+
+    p_uninstall = sub.add_parser("uninstall", help="remove the post-commit hook")
+    p_uninstall.set_defaults(func=cmd_uninstall)
+
+    args = ap.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""mem-pick: choose one memory, by number.
+
+A search or the inbox, numbered, and one answer on stdout — the body, the id
+or the title. The menu goes to stderr, so command substitution gets the answer
+and nothing else:
+
+    mem show $(mem-pick "payment provider" --action id)
+    mem-pick --recent --external          # read the inbox
+
+No fzf: a numbered list works without installing anything.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+
+def mem_json(mem, db, args):
+    cmd = [mem] + (["--db", db] if db else []) + ["--json"] + args
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        raise SystemExit(proc.returncode)
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        sys.stderr.write(proc.stderr)
+        raise SystemExit(f"mem-pick: `{mem} {' '.join(args)}` did not answer with JSON")
+
+
+def rows_from_search(doc):
+    return [{
+        "id": r["id"],
+        "project": r.get("project", ""),
+        "label": f"{r.get('words_matched', 0)}/{r.get('words_total', 0)}",
+        "status": r.get("status"),
+        "title": r.get("title", ""),
+    } for r in doc.get("results", [])]
+
+
+def rows_from_recent(doc):
+    return [{
+        "id": r["id"],
+        "project": r.get("project", ""),
+        "label": (r.get("when") or "")[:16],
+        "status": r.get("status"),
+        "title": r.get("title", ""),
+    } for r in doc.get("items", [])]
+
+
+def render(rows):
+    idw = max(len("id"), *(len(str(r["id"])) for r in rows))
+    pw = max(len("project"), *(len(r["project"]) for r in rows))
+    lw = max(len("matched"), *(len(r["label"]) for r in rows))
+    lines = [f"  {'#':>2}  {'id':<{idw}}  {'project':<{pw}}  {'matched':<{lw}}  title"]
+    for n, r in enumerate(rows, 1):
+        flag = " [draft]" if r["status"] == "draft" else ""
+        lines.append(f"  {n:>2}  {r['id']:<{idw}}  {r['project']:<{pw}}  "
+                     f"{r['label']:<{lw}}  {r['title']}{flag}")
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="mem-pick",
+        description="Pick one memory from a search or the inbox, by number.",
+    )
+    ap.add_argument("query", nargs="*", help="what to search for")
+    ap.add_argument("--recent", action="store_true",
+                    help="list what was saved lately instead of searching")
+    ap.add_argument("--external", action="store_true",
+                    help="with --recent: the inbox, drafts included")
+    ap.add_argument("--project")
+    ap.add_argument("--limit", type=int, default=10, help="results to list (default: 10)")
+    ap.add_argument("--action", choices=("body", "id", "title"), default=None,
+                    help="what to print (default: body on a terminal, id in a pipe)")
+    ap.add_argument("--pick", type=int, metavar="N",
+                    help="choose N without prompting, for scripts and tests")
+    ap.add_argument("--db", help="passed through to `mem --db`")
+    ap.add_argument("--mem", default=os.environ.get("MEM_BIN", "mem"),
+                    help="the mem binary (default: $MEM_BIN or mem)")
+    args = ap.parse_args()
+
+    if args.recent:
+        cmd = ["recent", "--all", "--limit", str(args.limit)]
+        if args.external:
+            cmd.append("--external")
+        if args.project:
+            cmd += ["--project", args.project]
+        rows = rows_from_recent(mem_json(args.mem, args.db, cmd))
+    else:
+        if not args.query:
+            ap.error("give something to search for, or --recent")
+        cmd = ["search", " ".join(args.query), "--limit", str(args.limit)]
+        if args.project:
+            cmd += ["--project", args.project]
+        rows = rows_from_search(mem_json(args.mem, args.db, cmd))
+
+    if not rows:
+        print("mem-pick: nothing to pick from.", file=sys.stderr)
+        return 1
+
+    print(render(rows), file=sys.stderr)
+
+    if args.pick is not None:
+        n = args.pick
+    elif sys.stdin.isatty():
+        try:
+            answer = input(f"pick [1-{len(rows)}, q]: ").strip()
+        except EOFError:
+            return 1
+        if answer.lower() in ("q", ""):
+            return 1
+        try:
+            n = int(answer)
+        except ValueError:
+            print("mem-pick: not a number.", file=sys.stderr)
+            return 2
+    else:
+        print("mem-pick: no terminal to ask; pass --pick N.", file=sys.stderr)
+        return 2
+
+    if not 1 <= n <= len(rows):
+        print(f"mem-pick: pick between 1 and {len(rows)}.", file=sys.stderr)
+        return 2
+
+    chosen = rows[n - 1]
+    action = args.action or ("body" if sys.stdout.isatty() else "id")
+    if action == "id":
+        print(chosen["id"])
+    elif action == "title":
+        print(chosen["title"])
+    else:
+        cmd = [args.mem] + (["--db", args.db] if args.db else []) + ["show", str(chosen["id"])]
+        return subprocess.run(cmd).returncode
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

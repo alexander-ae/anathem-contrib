@@ -1,0 +1,7 @@
+[Unit]
+Description=Check anathem's health and alert on a change
+
+[Service]
+Type=oneshot
+# Add --on-change '<command>' here to be told; see doctor-watch/README.md.
+ExecStart=%h/.local/bin/doctor-watch

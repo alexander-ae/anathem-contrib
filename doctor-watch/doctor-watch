@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""doctor-watch: alerts when `mem doctor` changes its mind.
+
+Runs `mem doctor --json`, keeps the last result in a state file, and runs a
+command only when something changed: a problem appeared, the set of problems
+changed, or everything came back. Unchanged runs are silent, so a timer every
+five minutes does not become five hundred lines a day.
+
+The alert command receives the outcome in environment variables and never has
+the text interpolated into it — the same rule stele uses for `notify_cmd`.
+
+    doctor-watch --on-change 'ntfy publish anathem "$DOCTOR_MESSAGE"'
+    doctor-watch --db ~/.anathem/mem.db --verbose
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+DEFAULT_STATE = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "anathem", "doctor-watch.json",
+)
+
+
+def doctor(mem, db, timeout):
+    """Runs `mem doctor --json` and returns its document.
+
+    Exit 0 and 1 are both answers (no problems, problems); anything else means
+    the diagnosis itself broke, and a monitor that guesses at that is worse
+    than one that says it could not check.
+    """
+    cmd = [mem] + (["--db", db] if db else []) + ["doctor", "--json"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        raise SystemExit(f"doctor-watch: cannot run {mem!r}; pass --mem or put it on PATH")
+    except subprocess.TimeoutExpired:
+        raise SystemExit(f"doctor-watch: `{mem} doctor` did not answer in {timeout}s")
+    if proc.returncode not in (0, 1):
+        raise SystemExit(f"doctor-watch: `{mem} doctor --json` exited {proc.returncode}\n"
+                         f"{proc.stderr.strip()}")
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        raise SystemExit(f"doctor-watch: `{mem} doctor --json` did not answer with JSON\n"
+                         f"{proc.stdout}")
+
+
+def findings(report):
+    """The bad findings, in the order doctor printed them."""
+    out = []
+    for section in report.get("sections", []):
+        for line in section.get("lines", []):
+            if line.get("level") == "bad":
+                out.append(f"{section['title']}: {line['text']}")
+    return out
+
+
+def fingerprint(bad):
+    digest = hashlib.sha256("\n".join(bad).encode()).hexdigest()
+    return digest[:16]
+
+
+def one_line(text, limit=300):
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def load_state(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def save_state(path, state):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def alert(command, report, bad, change, previous):
+    summary = (f"{report['problems']} problem{'s' if report['problems'] != 1 else ''}, "
+               f"{report['warnings']} warning{'s' if report['warnings'] != 1 else ''}")
+    message = f"anathem doctor at {report.get('database', '?')}: {summary}"
+    if change == "recovered":
+        message = f"anathem doctor recovered at {report.get('database', '?')}: {summary}"
+    elif previous is not None:
+        message += f" (was {previous.get('problems', '?')})"
+    if bad:
+        message += f" — {one_line(bad[0])}"
+
+    env = dict(os.environ,
+               DOCTOR_STATUS="ok" if report.get("ok") else "bad",
+               DOCTOR_CHANGE=change,
+               DOCTOR_PROBLEMS=str(report.get("problems", 0)),
+               DOCTOR_WARNINGS=str(report.get("warnings", 0)),
+               DOCTOR_DATABASE=report.get("database", ""),
+               DOCTOR_MESSAGE=message,
+               DOCTOR_FINDINGS="\n".join(bad))
+    proc = subprocess.run(command, shell=True, env=env)
+    if proc.returncode != 0:
+        raise SystemExit(f"doctor-watch: the alert command exited {proc.returncode}")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="doctor-watch",
+        description="Runs `mem doctor --json` and alerts only when the result changes.",
+    )
+    ap.add_argument("--mem", default=os.environ.get("MEM_BIN", "mem"),
+                    help="the mem binary (default: $MEM_BIN or mem)")
+    ap.add_argument("--db", help="passed through to `mem --db`")
+    ap.add_argument("--state", default=DEFAULT_STATE,
+                    help=f"state file (default: {DEFAULT_STATE})")
+    ap.add_argument("--on-change", metavar="CMD",
+                    help="shell command to run when the result changes; it reads "
+                         "DOCTOR_STATUS, DOCTOR_CHANGE, DOCTOR_PROBLEMS, DOCTOR_WARNINGS, "
+                         "DOCTOR_DATABASE, DOCTOR_MESSAGE and DOCTOR_FINDINGS")
+    ap.add_argument("--timeout", type=int, default=90,
+                    help="seconds to wait for `mem doctor` (default: 90)")
+    ap.add_argument("--verbose", action="store_true",
+                    help="print the state on every run, not only on a change")
+    ap.add_argument("--fail-on-problem", action="store_true",
+                    help="exit 1 when doctor found problems, so a timer marks the unit failed")
+    args = ap.parse_args()
+
+    report = doctor(args.mem, args.db, args.timeout)
+    bad = findings(report)
+    now = {
+        "ok": bool(report.get("ok")),
+        "problems": report.get("problems", 0),
+        "warnings": report.get("warnings", 0),
+        "fingerprint": fingerprint(bad),
+        "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    previous = load_state(args.state)
+
+    change = None
+    if previous is None:
+        change = "first-bad" if bad else None
+    elif not now["ok"] and (previous.get("ok") or previous.get("fingerprint") != now["fingerprint"]):
+        change = "problem"
+    elif now["ok"] and not previous.get("ok"):
+        change = "recovered"
+
+    if change and args.on_change:
+        # After a successful alert, not before: a broken notifier must not
+        # swallow the only notice of a problem. The next run retries.
+        alert(args.on_change, report, bad, change, previous)
+
+    save_state(args.state, now)
+
+    if change or args.verbose:
+        state = "ok" if now["ok"] else f"{now['problems']} problem(s)"
+        line = f"doctor: {state}"
+        if change:
+            line += f" [{change}]"
+        print(line)
+        for finding in bad:
+            print(f"  {one_line(finding)}")
+
+    if args.fail_on_problem and not now["ok"]:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

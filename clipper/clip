@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""clip: a web page, as an anathem draft in plain text.
+
+The page is extracted to text and filed with `mem save --external`, so it stays
+invisible to search until someone accepts it. That draft gate is the read-later
+queue: `mem recent --all --external` lists it, `mem accept <id>` is reading it.
+
+The URL is the `--ext-id`, so clipping the same page twice writes one memory.
+Standard library only. `extract()` is a heuristic and can be swapped for a
+readability library without touching anything else.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from html.parser import HTMLParser
+
+UA = "anathem-clipper/1 (+https://gitlab.com/__alexander__/anathem-contrib)"
+VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+        "meta", "param", "source", "track", "wbr"}
+# Removed before extraction. `<figure>` stays: its caption is often the only
+# prose a chart has.
+NOISE = {"script", "style", "nav", "header", "footer", "aside", "form",
+         "iframe", "noscript", "svg", "template", "button", "select"}
+BLOCKS = ("p", "h2", "h3", "h4", "li", "blockquote", "pre", "dt", "dd")
+# Query parameters that track a visit rather than name the page.
+TRACKING = re.compile(r"^(utm_|fbclid$|gclid$|mc_cid$|mc_eid$|ref$|source$)", re.I)
+
+
+class Node:
+    __slots__ = ("tag", "attrs", "children", "parent")
+
+    def __init__(self, tag, attrs=None, parent=None):
+        self.tag = tag
+        self.attrs = {k.lower(): (v or "") for k, v in (attrs or [])}
+        self.children = []
+        self.parent = parent
+
+
+class Tree(HTMLParser):
+    """A small DOM: enough to pick a subtree and read its text."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.root = Node("#document")
+        self.stack = [self.root]
+
+    def handle_starttag(self, tag, attrs):
+        node = Node(tag, attrs, self.stack[-1])
+        self.stack[-1].children.append(node)
+        if tag not in VOID:
+            self.stack.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        self.stack[-1].children.append(Node(tag, attrs, self.stack[-1]))
+
+    def handle_endtag(self, tag):
+        # Pop to the matching open tag; a stray close tag is ignored instead of
+        # unbalancing the tree, which is what the web actually sends.
+        for i in range(len(self.stack) - 1, 0, -1):
+            if self.stack[i].tag == tag:
+                del self.stack[i:]
+                return
+
+    def handle_data(self, data):
+        self.stack[-1].children.append(data)
+
+
+def walk(node):
+    yield node
+    for c in node.children:
+        if isinstance(c, Node):
+            yield from walk(c)
+
+
+def text_of(node):
+    return "".join(c if isinstance(c, str) else text_of(c) for c in node.children)
+
+
+def find_all(node, tags):
+    return [n for n in walk(node) if n.tag in tags]
+
+
+def collapse(s):
+    return re.sub(r"[ \t\r\f\v]+", " ", s.replace("\n", " ")).strip()
+
+
+def meta_content(doc, prop=None, name=None):
+    for n in walk(doc):
+        if n.tag != "meta":
+            continue
+        if prop and n.attrs.get("property", "").lower() == prop:
+            return collapse(n.attrs.get("content", ""))
+        if name and n.attrs.get("name", "").lower() == name:
+            return collapse(n.attrs.get("content", ""))
+    return ""
+
+
+def canonical_url(doc, base):
+    for n in walk(doc):
+        if n.tag == "link" and "canonical" in n.attrs.get("rel", "").lower():
+            href = n.attrs.get("href", "").strip()
+            if href:
+                return href
+    return base
+
+
+def strip_tracking(url):
+    parts = urllib.parse.urlsplit(url)
+    query = [(k, v) for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+             if not TRACKING.match(k)]
+    return urllib.parse.urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(query), "")
+    )
+
+
+def prune(node):
+    kept = []
+    for c in node.children:
+        if isinstance(c, Node):
+            if c.tag in NOISE:
+                continue
+            prune(c)
+            kept.append(c)
+        else:
+            kept.append(c)
+    node.children = kept
+
+
+def link_ratio(node):
+    total = len(collapse(text_of(node)))
+    if total == 0:
+        return 1.0
+    linked = sum(len(collapse(text_of(n))) for n in find_all(node, ("a",)))
+    return linked / total
+
+
+def blocks(node):
+    """Paragraphs with the markup worth keeping.
+
+    Headings come out as `##` lines because anathem's `outline` setting reads
+    them; lists and quotes keep their marker so the text still reads.
+    """
+    out = []
+    for n in find_all(node, BLOCKS):
+        if n.tag == "pre":
+            raw = text_of(n).strip("\n").rstrip()
+            if raw.strip():
+                out.append("```\n" + raw + "\n```")
+            continue
+        t = collapse(text_of(n))
+        if len(t) < 3:
+            continue
+        prefix = {"h2": "## ", "h3": "### ", "h4": "#### ",
+                  "li": "- ", "blockquote": "> "}.get(n.tag, "")
+        out.append(prefix + t)
+    return out
+
+
+def extract(html_text):
+    """Title, description and article text.
+
+    Picks the densest of `<article>`, `<main>` and the block elements,
+    discounting how much of it is links: a page of anchors scores near zero and
+    falls back to the body's paragraphs.
+    """
+    parser = Tree()
+    parser.feed(html_text)
+    doc = parser.root
+
+    titles = find_all(doc, ("title",))
+    title = (meta_content(doc, prop="og:title")
+             or meta_content(doc, name="twitter:title")
+             or (collapse(text_of(titles[0])) if titles else ""))
+    if not title:
+        h1 = find_all(doc, ("h1",))
+        title = collapse(text_of(h1[0])) if h1 else ""
+    description = (meta_content(doc, prop="og:description")
+                   or meta_content(doc, name="twitter:description")
+                   or meta_content(doc, name="description"))
+
+    body = next((n for n in walk(doc) if n.tag == "body"), doc)
+    prune(body)
+
+    best, best_score = None, 0.0
+    for n in walk(body):
+        if n.tag not in ("article", "main", "div", "section"):
+            continue
+        size = sum(len(t) for t in blocks(n))
+        if size < 200:
+            continue
+        score = size * (1.0 - link_ratio(n))
+        if score > best_score:
+            best, best_score = n, score
+
+    chosen = best if best is not None else body
+    text_blocks = blocks(chosen)
+    if len(text_blocks) < 2 and best is not None:
+        text_blocks = blocks(body)
+    return title, description, "\n\n".join(text_blocks)
+
+
+def fetch(url, timeout=20):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en,es;q=0.8",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+        charset = resp.headers.get_content_charset() or "utf-8"
+        final = resp.geturl()
+    try:
+        return raw.decode(charset, errors="replace"), final
+    except LookupError:
+        return raw.decode("utf-8", errors="replace"), final
+
+
+def truncate(text, limit):
+    """Cuts at a paragraph boundary. Returns (kept, was_truncated)."""
+    if len(text) <= limit:
+        return text, False
+    cut = text.rfind("\n\n", 0, limit)
+    if cut < limit // 2:
+        cut = limit
+    return text[:cut].rstrip(), True
+
+
+def memory_body(title, description, source, text, truncated, dropped):
+    lines = [title, ""]
+    if description:
+        lines += [description, ""]
+    lines.append(f"source: {source}")
+    lines.append(f"fetched: {datetime.date.today().isoformat()}")
+    if truncated:
+        lines.append(f"truncated: kept the first part; {dropped} characters left out")
+    lines += ["", "---", "", text]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def mem_call(mem, db, args, stdin=None):
+    cmd = [mem] + (["--db", db] if db else []) + ["--json"] + args
+    proc = subprocess.run(cmd, input=stdin, text=True, capture_output=True)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        raise SystemExit(proc.returncode)
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        sys.stderr.write(proc.stderr)
+        raise SystemExit(f"clip: `{mem} {' '.join(args)}` did not answer with JSON\n{proc.stdout}")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="clip",
+        description="Saves a web page into anathem as an external draft, in plain text.",
+    )
+    ap.add_argument("url", nargs="?", help="the page to clip")
+    ap.add_argument("--from-file", metavar="HTML",
+                    help="read the HTML from a file instead of fetching (tests, PDFs)")
+    ap.add_argument("--url", dest="url_override", metavar="URL",
+                    help="the address to record when the HTML comes from --from-file")
+    ap.add_argument("--project", default="reading")
+    ap.add_argument("--tag", action="append", default=["reading"])
+    ap.add_argument("--from", dest="sender", default="clipper",
+                    help="the --from label anathem records (default: clipper)")
+    ap.add_argument("--accept", action="store_true",
+                    help="accept it right away instead of leaving it as a draft")
+    ap.add_argument("--max-chars", type=int, default=10000,
+                    help="characters of text to keep (default: 10000)")
+    ap.add_argument("--db", help="passed through to `mem --db`")
+    ap.add_argument("--mem", default=os.environ.get("MEM_BIN", "mem"),
+                    help="the mem binary (default: $MEM_BIN or mem)")
+    args = ap.parse_args()
+
+    if args.from_file:
+        with open(args.from_file, encoding="utf-8", errors="replace") as fh:
+            html_text = fh.read()
+        base = args.url_override or args.url or "file://" + os.path.abspath(args.from_file)
+    elif args.url:
+        try:
+            html_text, base = fetch(args.url)
+        except urllib.error.HTTPError as e:
+            raise SystemExit(f"clip: {args.url} answered {e.code} {e.reason}. "
+                             "Nothing was saved.")
+        except urllib.error.URLError as e:
+            raise SystemExit(f"clip: could not fetch {args.url}: {e.reason}. "
+                             "Nothing was saved.")
+        except TimeoutError:
+            raise SystemExit(f"clip: {args.url} timed out. Nothing was saved.")
+    else:
+        ap.error("give a URL, or --from-file with --url")
+
+    title, description, text = extract(html_text)
+    if not text.strip():
+        raise SystemExit("clip: no readable text on that page; it may be built by "
+                         "JavaScript. Nothing was saved.")
+
+    parser = Tree()
+    parser.feed(html_text)
+    source = strip_tracking(args.url_override or canonical_url(parser.root, base))
+    kept, truncated = truncate(text, args.max_chars)
+    body = memory_body(title or source, description, source, kept,
+                       truncated, len(text) - len(kept))
+
+    tags = [x for t in args.tag for x in ("--tag", t)]
+    got = mem_call(args.mem, args.db, [
+        "save", "-", "--external", "--from", args.sender,
+        "--project", args.project, *tags, "--ext-id", source,
+    ], stdin=body)
+
+    if got.get("written") is False:
+        print(f"already clipped: id {got['id']} ({source})")
+        return 0
+
+    ident = got["id"]
+    if args.accept:
+        mem_call(args.mem, args.db, ["accept", str(ident)])
+        print(f"clipped: id {ident} in {got['project']}, accepted — searches can see it now")
+    else:
+        print(f"clipped: id {ident} in {got['project']}, saved as a draft")
+        print(f"  `mem accept {ident}` to let it in, or `mem show {ident}` to read it whole")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

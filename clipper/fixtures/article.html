@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Kubernetes eviction, in practice | Some Blog</title>
+  <meta property="og:title" content="Kubernetes eviction, in practice">
+  <meta property="og:description" content="What the eviction manager actually does when a node runs out of memory, and the three settings that decide who dies.">
+  <link rel="canonical" href="https://example.com/k8s-eviction">
+  <script>window.analytics = {track: function () { return "SHOULD NOT APPEAR"; }};</script>
+  <style>.nav { color: red } /* SHOULD NOT APPEAR */</style>
+</head>
+<body>
+  <nav class="nav">
+    <a href="/">Home</a>
+    <a href="/about">About</a>
+    <a href="/pricing">Pricing</a>
+  </nav>
+  <div class="cookie-banner">We use cookies. SHOULD NOT APPEAR. <button>Accept</button></div>
+
+  <article>
+    <h1>Kubernetes eviction, in practice</h1>
+    <p>When a node runs out of memory, the kubelet does not kill the largest pod. It ranks every pod by the quality of service it was given, and evicts from the bottom.</p>
+    <p>BestEffort goes first, then Burstable above its request, then Guaranteed only if nothing else is left. The eviction manager runs every ten seconds by default, and the thresholds are soft: it reclaims until the signal drops below the threshold, not to zero.</p>
+    <h2>The three settings that matter</h2>
+    <p>Eviction hard is a cliff, eviction soft is a slope, and the grace period is how long the kubelet waits before it stops waiting.</p>
+    <ul>
+      <li>memory.available below 100Mi is hard.</li>
+      <li>nodefs.available below 10% is soft.</li>
+    </ul>
+    <p>None of it is a substitute for setting requests, which is what makes the ranking mean anything.</p>
+  </article>
+
+  <footer>
+    <p>Copyright 2026 Some Blog. All rights reserved. SHOULD NOT APPEAR.</p>
+    <a href="/privacy">Privacy</a>
+  </footer>
+  <script>console.log("SHOULD NOT APPEAR");</script>
+</body>
+</html>

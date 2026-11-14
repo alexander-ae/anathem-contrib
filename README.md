@@ -13,6 +13,7 @@ change in one folder break another.
 | integration | what it does | needs |
 |---|---|---|
 | [`clipper/`](clipper/) | a web page as a plain-text draft, one per URL | `mem` 1.1+, `python3`, `jq` (tests only) |
+| [`doctor-watch/`](doctor-watch/) | alerts when `mem doctor` changes its mind, on a timer | `mem` 1.1+, `python3`, systemd (optional) |
 
 ## What is not here
 

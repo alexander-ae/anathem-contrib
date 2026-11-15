@@ -5,7 +5,6 @@ name: test
 # as anathem itself, which builds its binaries here.
 on:
   push:
-    branches: [main]
   pull_request:
 
 env:

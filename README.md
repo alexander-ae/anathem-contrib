@@ -35,6 +35,14 @@ Each folder has a `test.sh` that runs against a temporary database:
 MEM_BIN=/path/to/mem ./run-all.sh
 ```
 
+The pipeline runs the same thing against the binary of the **pinned release**
+(`MEM_TAG` in `.github/workflows/test.yml`), after checking its sha256. Bumping
+that tag is a deliberate one-line change per anathem release.
+
+GitLab is canonical; the tests run on GitHub Actions, because Actions is free
+for public repositories and GitLab's shared-runner quota is exhausted. anathem
+builds its binaries there for the same reason.
+
 ## The contract
 
 [`docs/integrations.md`](https://gitlab.com/__alexander__/anathem/-/blob/main/docs/integrations.md)

@@ -5,7 +5,15 @@
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-MEM=$(command -v "${MEM_BIN:-mem}")
+MEM=$(command -v "${MEM_BIN:-mem}") || {
+  printf 'MEM_BIN=%s is not executable\n' "${MEM_BIN:-mem}" >&2
+  exit 2
+}
+# Absolute: the hook runs inside the temporary repository, where a relative
+# path would point at nothing.
+case "$MEM" in
+  */*) MEM=$(cd "$(dirname "$MEM")" && pwd)/$(basename "$MEM") ;;
+esac
 CAP="$HERE/git-capture"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

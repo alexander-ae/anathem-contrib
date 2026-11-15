@@ -1,0 +1,34 @@
+name: test
+
+# GitLab is canonical; this mirror exists because Actions is free for public
+# repositories and GitLab's shared-runner quota is exhausted. Same arrangement
+# as anathem itself, which builds its binaries here.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  # Pinned on purpose: a pipeline that passed should not start failing because
+  # somebody else released. Bumping it is the deliberate one-line change per
+  # anathem release.
+  MEM_TAG: v1.1.0
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the released binary and check its sha256
+        run: |
+          base="https://gitlab.com/__alexander__/anathem/-/releases/${MEM_TAG}/downloads"
+          curl -fsSL -o mem-linux-x86_64.tar.gz "$base/mem-linux-x86_64.tar.gz"
+          curl -fsSL -o mem-linux-x86_64.tar.gz.sha256 "$base/mem-linux-x86_64.tar.gz.sha256"
+          sha256sum -c mem-linux-x86_64.tar.gz.sha256
+          tar -xzf mem-linux-x86_64.tar.gz
+
+      - name: Every integration, against that binary
+        run: |
+          ./mem --version
+          MEM_BIN=./mem ./run-all.sh
